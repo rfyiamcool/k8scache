@@ -13,14 +13,14 @@ func TestTimout(t *testing.T) {
 	assert.Equal(t, err, nil)
 
 	start := time.Now()
-	done, _ := cc.TimeoutChan(1 * time.Second)
+	done, _ := cc.timeoutChan(1 * time.Second)
 	select {
 	case <-done:
 	}
 	assert.Less(t, time.Since(start).Seconds(), float64(3))
 
 	start2 := time.Now()
-	done2, _ := cc.TimeoutChan(0)
+	done2, _ := cc.timeoutChan(0)
 	select {
 	case <-done2:
 	case <-time.After(1 * time.Second):

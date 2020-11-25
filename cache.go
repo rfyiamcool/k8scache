@@ -22,8 +22,9 @@ import (
 )
 
 const (
-	TypePod         = "pod"
-	TypeNode        = "node"
+	TypeNamespace   = "Namespace"
+	TypePod         = "Pod"
+	TypeNode        = "Node"
 	TypeService     = "Service"
 	TypeReplicaSet  = "ReplicaSet"
 	TypeDeployment  = "Deployment"
@@ -37,6 +38,7 @@ var (
 	ErrSyncResourceTimeout = errors.New("sync resource timeout")
 
 	allResources = map[string]bool{
+		TypeNamespace:   true,
 		TypePod:         true,
 		TypeNode:        true,
 		TypeService:     true,
@@ -177,6 +179,7 @@ func NewClusterCache(client *Client, opts ...OptionFunc) (*ClusterCache, error) 
 		stopper:        make(chan struct{}, 0),
 		cache:          make(map[string]*DataSet, 5),
 		nodes:          make(map[string]*corev1.Node, 5),
+		namespaces:     make(map[string]*corev1.Namespace, 5),
 		followResource: allResources,
 	}
 	for _, opt := range opts {
@@ -199,6 +202,7 @@ type ClusterCache struct {
 	stopOnce sync.Once
 
 	factory            informers.SharedInformerFactory
+	namespaceInformer  cache.SharedIndexInformer
 	podInformer        cache.SharedIndexInformer
 	nodeInformer       cache.SharedIndexInformer
 	serviceInformer    cache.SharedIndexInformer
@@ -208,7 +212,8 @@ type ClusterCache struct {
 	statefulInformer   cache.SharedIndexInformer
 
 	nodes      map[string]*corev1.Node
-	cache      map[string]*DataSet
+	namespaces map[string]*corev1.Namespace
+	cache      map[string]*DataSet // key: namespace, val: *DataSet
 	cacheMutex sync.RWMutex
 }
 
@@ -256,6 +261,7 @@ func (c *ClusterCache) isFollowResource(res string) bool {
 }
 
 func (c *ClusterCache) bindResourceInformer() {
+	c.bindNamespaceInformer()
 	c.bindPodInformer()
 	c.bindNodesInformer()
 	c.bindReplicaInformer()
@@ -273,7 +279,7 @@ func (c *ClusterCache) SyncCache() error {
 	return c.SyncCacheWithTimeout(defaultSyncTimeout)
 }
 
-func (c *ClusterCache) TimeoutChan(ts time.Duration) (chan struct{}, *time.Timer) {
+func (c *ClusterCache) timeoutChan(ts time.Duration) (chan struct{}, *time.Timer) {
 	done := make(chan struct{})
 	if ts == 0 {
 		return done, time.NewTimer(0)
@@ -292,6 +298,7 @@ func (c *ClusterCache) SyncCacheWithTimeout(timeout time.Duration) error {
 	)
 
 	funcs = append(funcs,
+		c.SyncNamespacesCache,
 		c.SyncPodsCache,
 		c.SyncNodesCache,
 		c.SyncServicesCache,
@@ -317,6 +324,55 @@ func (c *ClusterCache) SyncCacheWithTimeout(timeout time.Duration) error {
 	wg.Wait()
 
 	return err
+}
+
+func (c *ClusterCache) bindNamespaceInformer() {
+	c.namespaceInformer = c.factory.Core().V1().Namespaces().Informer()
+	add := func(obj interface{}) {
+		ns, ok := obj.(*corev1.Namespace)
+		if !ok {
+			return
+		}
+
+		c.cacheMutex.Lock()
+		defer c.cacheMutex.Unlock()
+
+		c.namespaces[ns.Name] = ns
+	}
+	update := func(oldObj, newObj interface{}) {
+		add(newObj)
+	}
+	del := func(obj interface{}) {
+		ns, ok := obj.(*corev1.Namespace)
+		if !ok {
+			return
+		}
+
+		c.cacheMutex.Lock()
+		defer c.cacheMutex.Unlock()
+
+		delete(c.namespaces, ns.Name)
+	}
+
+	c.namespaceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    add,
+		UpdateFunc: update,
+		DeleteFunc: del,
+	})
+}
+
+func (c *ClusterCache) SyncNamespacesCache(timeout time.Duration) error {
+	if !c.isFollowResource(TypePod) {
+		return nil
+	}
+
+	done, timer := c.timeoutChan(timeout)
+	defer timer.Stop()
+
+	if !cache.WaitForCacheSync(done, c.namespaceInformer.HasSynced) {
+		return ErrSyncResourceTimeout
+	}
+	return nil
 }
 
 func (c *ClusterCache) bindPodInformer() {
@@ -373,7 +429,7 @@ func (c *ClusterCache) SyncPodsCache(timeout time.Duration) error {
 		return nil
 	}
 
-	done, timer := c.TimeoutChan(timeout)
+	done, timer := c.timeoutChan(timeout)
 	defer timer.Stop()
 
 	if !cache.WaitForCacheSync(done, c.podInformer.HasSynced) {
@@ -419,7 +475,7 @@ func (c *ClusterCache) bindNodesInformer() {
 }
 
 func (c *ClusterCache) SyncNodesCache(timeout time.Duration) error {
-	done, timer := c.TimeoutChan(timeout)
+	done, timer := c.timeoutChan(timeout)
 	defer timer.Stop()
 
 	if !cache.WaitForCacheSync(done, c.nodeInformer.HasSynced) {
@@ -484,7 +540,7 @@ func (c *ClusterCache) SyncServicesCache(timeout time.Duration) error {
 		return nil
 	}
 
-	done, timer := c.TimeoutChan(timeout)
+	done, timer := c.timeoutChan(timeout)
 	defer timer.Stop()
 
 	if !cache.WaitForCacheSync(done, c.serviceInformer.HasSynced) {
@@ -548,7 +604,7 @@ func (c *ClusterCache) SyncDeploymentsCache(timeout time.Duration) error {
 		return nil
 	}
 
-	done, timer := c.TimeoutChan(timeout)
+	done, timer := c.timeoutChan(timeout)
 	defer timer.Stop()
 
 	if !cache.WaitForCacheSync(done, c.deploymentInformer.HasSynced) {
@@ -611,7 +667,7 @@ func (c *ClusterCache) SyncReplicasCache(timeout time.Duration) error {
 		return nil
 	}
 
-	done, timer := c.TimeoutChan(timeout)
+	done, timer := c.timeoutChan(timeout)
 	defer timer.Stop()
 
 	if !cache.WaitForCacheSync(done, c.replicaInformer.HasSynced) {
@@ -674,7 +730,7 @@ func (c *ClusterCache) SyncStatefulCache(timeout time.Duration) error {
 		return nil
 	}
 
-	done, timer := c.TimeoutChan(timeout)
+	done, timer := c.timeoutChan(timeout)
 	defer timer.Stop()
 
 	if !cache.WaitForCacheSync(done, c.statefulInformer.HasSynced) {
@@ -737,7 +793,7 @@ func (c *ClusterCache) SyncDaemonCache(timeout time.Duration) error {
 		return nil
 	}
 
-	done, timer := c.TimeoutChan(timeout)
+	done, timer := c.timeoutChan(timeout)
 	defer timer.Stop()
 
 	if !cache.WaitForCacheSync(done, c.daemonInformer.HasSynced) {
@@ -823,13 +879,13 @@ func (c *ClusterCache) GetUpdateTimeWithNs(ns string) (time.Time, error) {
 	return data.UpdateAT, nil
 }
 
-func (c *ClusterCache) GetNamespaces() ([]string, error) {
+func (c *ClusterCache) GetNamespaces() (map[string]*corev1.Namespace, error) {
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
-	namespaces := []string{}
-	for ns, _ := range c.cache {
-		namespaces = append(namespaces, ns)
+	namespaces := make(map[string]*corev1.Namespace, len(c.namespaces))
+	for name, obj := range c.namespaces {
+		namespaces[name] = obj
 	}
 	return namespaces, nil
 }
@@ -956,11 +1012,13 @@ func (c *ClusterCache) GetReplicaWithNS(ns string, name string) (*v1.ReplicaSet,
 
 func newDataSet(ns string) *DataSet {
 	return &DataSet{
-		Namespace:   ns,
-		Pods:        make(map[string]*corev1.Pod, 10),
-		Services:    make(map[string]*corev1.Service, 10),
-		Deployments: make(map[string]*v1.Deployment, 10),
-		Replicas:    make(map[string]*v1.ReplicaSet, 10),
+		Namespace:    ns,
+		Pods:         make(map[string]*corev1.Pod, 10),
+		Services:     make(map[string]*corev1.Service, 10),
+		Deployments:  make(map[string]*v1.Deployment, 10),
+		Replicas:     make(map[string]*v1.ReplicaSet, 10),
+		Daemons:      make(map[string]*v1.DaemonSet, 10),
+		StatefulSets: make(map[string]*v1.StatefulSet, 10),
 	}
 }
 
