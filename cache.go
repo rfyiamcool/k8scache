@@ -22,16 +22,29 @@ import (
 )
 
 const (
-	TypePod        = "pod"
-	TypeService    = "Service"
-	TypeReplicaSet = "ReplicaSet"
-	TypeDeployment = "deployment"
+	TypePod         = "pod"
+	TypeNode        = "node"
+	TypeService     = "Service"
+	TypeReplicaSet  = "ReplicaSet"
+	TypeDeployment  = "Deployment"
+	TypeDaemonSet   = "DaemonSet"
+	TypeStatefulSet = "StatefulSet"
 )
 
 var (
 	ErrNotFoundNamespace   = errors.New("not found namespace")
 	ErrNotFoundName        = errors.New("not found name")
 	ErrSyncResourceTimeout = errors.New("sync resource timeout")
+
+	allResources = map[string]bool{
+		TypePod:         true,
+		TypeNode:        true,
+		TypeService:     true,
+		TypeReplicaSet:  true,
+		TypeDeployment:  true,
+		TypeDaemonSet:   true,
+		TypeStatefulSet: true,
+	}
 )
 
 type Client struct {
@@ -138,12 +151,33 @@ func WithStopper(stopper chan struct{}) OptionFunc {
 	}
 }
 
+func WithFollowResource(rlist []string) OptionFunc {
+	return func(o *ClusterCache) error {
+		mm := map[string]bool{}
+		for _, res := range rlist {
+			mm[res] = true
+		}
+		o.followResource = mm // cover old val
+		return nil
+	}
+}
+
+func WithNotFollowResource(rlist []string) OptionFunc {
+	return func(o *ClusterCache) error {
+		for _, res := range rlist {
+			delete(o.followResource, res)
+		}
+		return nil
+	}
+}
+
 func NewClusterCache(client *Client, opts ...OptionFunc) (*ClusterCache, error) {
 	cc := &ClusterCache{
-		k8sClient: client,
-		stopper:   make(chan struct{}, 0),
-		cache:     make(map[string]*DataSet, 5),
-		nodes:     make(map[string]*corev1.Node, 5),
+		k8sClient:      client,
+		stopper:        make(chan struct{}, 0),
+		cache:          make(map[string]*DataSet, 5),
+		nodes:          make(map[string]*corev1.Node, 5),
+		followResource: allResources,
 	}
 	for _, opt := range opts {
 		err := opt(cc)
@@ -155,10 +189,11 @@ func NewClusterCache(client *Client, opts ...OptionFunc) (*ClusterCache, error) 
 }
 
 type ClusterCache struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	namespace string
-	k8sClient *Client
+	ctx            context.Context
+	cancel         context.CancelFunc
+	namespace      string
+	k8sClient      *Client
+	followResource map[string]bool
 
 	stopper  chan struct{}
 	stopOnce sync.Once
@@ -213,6 +248,11 @@ func (c *ClusterCache) isClosed() bool {
 	default:
 		return false
 	}
+}
+
+func (c *ClusterCache) isFollowResource(res string) bool {
+	_, ok := c.followResource[res]
+	return ok
 }
 
 func (c *ClusterCache) bindResourceInformer() {
@@ -280,6 +320,10 @@ func (c *ClusterCache) SyncCacheWithTimeout(timeout time.Duration) error {
 }
 
 func (c *ClusterCache) bindPodInformer() {
+	if !c.isFollowResource(TypePod) {
+		return
+	}
+
 	c.podInformer = c.factory.Core().V1().Pods().Informer()
 	add := func(obj interface{}) {
 		pod, ok := obj.(*corev1.Pod)
@@ -325,6 +369,10 @@ func (c *ClusterCache) bindPodInformer() {
 }
 
 func (c *ClusterCache) SyncPodsCache(timeout time.Duration) error {
+	if !c.isFollowResource(TypePod) {
+		return nil
+	}
+
 	done, timer := c.TimeoutChan(timeout)
 	defer timer.Stop()
 
@@ -335,6 +383,10 @@ func (c *ClusterCache) SyncPodsCache(timeout time.Duration) error {
 }
 
 func (c *ClusterCache) bindNodesInformer() {
+	if !c.isFollowResource(TypeNode) {
+		return
+	}
+
 	c.nodeInformer = c.factory.Core().V1().Nodes().Informer()
 	add := func(obj interface{}) {
 		node, ok := obj.(*corev1.Node)
@@ -377,6 +429,10 @@ func (c *ClusterCache) SyncNodesCache(timeout time.Duration) error {
 }
 
 func (c *ClusterCache) bindServiceInformer() {
+	if !c.isFollowResource(TypeService) {
+		return
+	}
+
 	c.serviceInformer = c.factory.Core().V1().Services().Informer()
 	add := func(obj interface{}) {
 		value, ok := obj.(*corev1.Service)
@@ -424,6 +480,10 @@ func (c *ClusterCache) bindServiceInformer() {
 }
 
 func (c *ClusterCache) SyncServicesCache(timeout time.Duration) error {
+	if !c.isFollowResource(TypeService) {
+		return nil
+	}
+
 	done, timer := c.TimeoutChan(timeout)
 	defer timer.Stop()
 
@@ -434,6 +494,10 @@ func (c *ClusterCache) SyncServicesCache(timeout time.Duration) error {
 }
 
 func (c *ClusterCache) bindDeploymentInformer() {
+	if !c.isFollowResource(TypeDeployment) {
+		return
+	}
+
 	c.deploymentInformer = c.factory.Apps().V1().Deployments().Informer()
 	add := func(obj interface{}) {
 		value, ok := obj.(*v1.Deployment)
@@ -480,6 +544,10 @@ func (c *ClusterCache) bindDeploymentInformer() {
 }
 
 func (c *ClusterCache) SyncDeploymentsCache(timeout time.Duration) error {
+	if !c.isFollowResource(TypeDeployment) {
+		return nil
+	}
+
 	done, timer := c.TimeoutChan(timeout)
 	defer timer.Stop()
 
@@ -490,6 +558,10 @@ func (c *ClusterCache) SyncDeploymentsCache(timeout time.Duration) error {
 }
 
 func (c *ClusterCache) bindReplicaInformer() {
+	if !c.isFollowResource(TypeReplicaSet) {
+		return
+	}
+
 	c.replicaInformer = c.factory.Apps().V1().ReplicaSets().Informer()
 	add := func(obj interface{}) {
 		value, ok := obj.(*v1.ReplicaSet)
@@ -535,6 +607,10 @@ func (c *ClusterCache) bindReplicaInformer() {
 }
 
 func (c *ClusterCache) SyncReplicasCache(timeout time.Duration) error {
+	if !c.isFollowResource(TypeReplicaSet) {
+		return nil
+	}
+
 	done, timer := c.TimeoutChan(timeout)
 	defer timer.Stop()
 
@@ -545,6 +621,10 @@ func (c *ClusterCache) SyncReplicasCache(timeout time.Duration) error {
 }
 
 func (c *ClusterCache) bindStatefulInformer() {
+	if !c.isFollowResource(TypeStatefulSet) {
+		return
+	}
+
 	c.statefulInformer = c.factory.Apps().V1().StatefulSets().Informer()
 	add := func(obj interface{}) {
 		value, ok := obj.(*v1.StatefulSet)
@@ -590,6 +670,10 @@ func (c *ClusterCache) bindStatefulInformer() {
 }
 
 func (c *ClusterCache) SyncStatefulCache(timeout time.Duration) error {
+	if !c.isFollowResource(TypeStatefulSet) {
+		return nil
+	}
+
 	done, timer := c.TimeoutChan(timeout)
 	defer timer.Stop()
 
@@ -600,6 +684,10 @@ func (c *ClusterCache) SyncStatefulCache(timeout time.Duration) error {
 }
 
 func (c *ClusterCache) bindDaemonInformer() {
+	if !c.isFollowResource(TypeDaemonSet) {
+		return
+	}
+
 	c.daemonInformer = c.factory.Apps().V1().DaemonSets().Informer()
 	add := func(obj interface{}) {
 		value, ok := obj.(*v1.DaemonSet)
@@ -645,6 +733,10 @@ func (c *ClusterCache) bindDaemonInformer() {
 }
 
 func (c *ClusterCache) SyncDaemonCache(timeout time.Duration) error {
+	if !c.isFollowResource(TypeDaemonSet) {
+		return nil
+	}
+
 	done, timer := c.TimeoutChan(timeout)
 	defer timer.Stop()
 
