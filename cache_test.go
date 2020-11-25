@@ -1,25 +1,33 @@
-## K8SCACHE
+package k8scache
 
-local cache for kubernetes apiserver cache
+import (
+	"fmt"
+	"testing"
+	"time"
 
-`k8scache is based on client-go informer`
+	"github.com/stretchr/testify/assert"
+)
 
-### Feature
+func TestTimout(t *testing.T) {
+	cc, err := NewClusterCache(nil)
+	assert.Equal(t, err, nil)
 
-**support resource list:**
+	start := time.Now()
+	done, _ := cc.timeoutChan(1 * time.Second)
+	select {
+	case <-done:
+	}
+	assert.Less(t, time.Since(start).Seconds(), float64(3))
 
-- namespace
-- pod
-- node
-- service 
-- replicaSet
-- deployment
-- daemonSet
-- statefulSet
+	start2 := time.Now()
+	done2, _ := cc.timeoutChan(0)
+	select {
+	case <-done2:
+	case <-time.After(1 * time.Second):
+	}
+	assert.Less(t, float64(0), time.Since(start2).Seconds())
+}
 
-### Usage
-
-```go
 func TestSimple(t *testing.T) {
 	cli, err := NewClient()
 	assert.Equal(t, err, nil)
@@ -70,6 +78,5 @@ func TestSimple(t *testing.T) {
 	time.AfterFunc(1*time.Second, func() {
 		cc.Stop()
 	})
-    cc.Wait()
+	cc.Wait()
 }
-```
