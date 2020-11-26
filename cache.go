@@ -888,6 +888,7 @@ func (c *ClusterCache) bindEventInformer() {
 		if !ok {
 			return
 		}
+
 		if !c.isFollowNamespace(value.Namespace) {
 			return
 		}
@@ -1160,7 +1161,7 @@ func (c *ClusterCache) GetNamespaces() (map[string]*corev1.Namespace, error) {
 	return namespaces, nil
 }
 
-func (c *ClusterCache) GetPodsWithNS(ns string) (map[string]*corev1.Pod, error) {
+func (c *ClusterCache) GetAllPods(ns string) (map[string]*corev1.Pod, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
@@ -1198,7 +1199,7 @@ func (c *ClusterCache) GetPod(ns string, name string) (*corev1.Pod, error) {
 	return pod, nil
 }
 
-func (c *ClusterCache) GetServices(ns string) (map[string]*corev1.Service, error) {
+func (c *ClusterCache) GetAllServices(ns string) (map[string]*corev1.Service, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
@@ -1236,7 +1237,7 @@ func (c *ClusterCache) GetService(ns string, name string) (*corev1.Service, erro
 	return service, nil
 }
 
-func (c *ClusterCache) GetDeployments(ns string) (map[string]*v1.Deployment, error) {
+func (c *ClusterCache) GetAllDeployments(ns string) (map[string]*v1.Deployment, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
@@ -1274,7 +1275,7 @@ func (c *ClusterCache) GetDeployment(ns string, name string) (*v1.Deployment, er
 	return dm, nil
 }
 
-func (c *ClusterCache) GetReplicas(ns string) (map[string]*v1.ReplicaSet, error) {
+func (c *ClusterCache) GetAllReplicas(ns string) (map[string]*v1.ReplicaSet, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
@@ -1312,7 +1313,7 @@ func (c *ClusterCache) GetReplica(ns string, name string) (*v1.ReplicaSet, error
 	return rep, nil
 }
 
-func (c *ClusterCache) GetDaemons(ns string) (map[string]*v1.DaemonSet, error) {
+func (c *ClusterCache) GetAllDaemons(ns string) (map[string]*v1.DaemonSet, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
@@ -1350,7 +1351,7 @@ func (c *ClusterCache) GetDaemon(ns string, name string) (*v1.DaemonSet, error) 
 	return rep, nil
 }
 
-func (c *ClusterCache) GetStatefuls(ns string) (map[string]*v1.StatefulSet, error) {
+func (c *ClusterCache) GetAllStatefuls(ns string) (map[string]*v1.StatefulSet, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
@@ -1388,7 +1389,7 @@ func (c *ClusterCache) GetStateful(ns string, name string) (*v1.StatefulSet, err
 	return rep, nil
 }
 
-func (c *ClusterCache) GetAllEvents(ns string) (map[string][]*corev1.Event, error) {
+func (c *ClusterCache) GetAllEvents(ns string) (map[string]map[string][]*corev1.Event, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
@@ -1405,7 +1406,7 @@ func (c *ClusterCache) GetAllEvents(ns string) (map[string][]*corev1.Event, erro
 	return data.CopyEvents(), nil
 }
 
-func (c *ClusterCache) GetEvents(ns string, name string) ([]*corev1.Event, error) {
+func (c *ClusterCache) GetEvents(ns, kind, name string) ([]*corev1.Event, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
@@ -1418,9 +1419,14 @@ func (c *ClusterCache) GetEvents(ns string, name string) ([]*corev1.Event, error
 		return nil, ErrNotFoundNamespace
 	}
 
-	evs, ok := data.Events[name]
+	kinds, ok := data.Events[name]
 	if !ok {
 		return nil, ErrNotFoundName
+	}
+
+	evs, ok := kinds[kind]
+	if !ok {
+		return nil, errors.New("not found the kind")
 	}
 
 	ret := make([]*corev1.Event, len(evs))
@@ -1475,7 +1481,7 @@ func newDataSet(ns string) *DataSet {
 		Replicas:     make(map[string]*v1.ReplicaSet, 10),
 		Daemons:      make(map[string]*v1.DaemonSet, 10),
 		StatefulSets: make(map[string]*v1.StatefulSet, 10),
-		Events:       make(map[string][]*corev1.Event, 10),
+		Events:       make(map[string]map[string][]*corev1.Event, 10),
 		Endpoints:    make(map[string]*corev1.Endpoints, 10),
 	}
 }
@@ -1488,8 +1494,8 @@ type DataSet struct {
 	Replicas     map[string]*v1.ReplicaSet  // ...
 	Daemons      map[string]*v1.DaemonSet
 	StatefulSets map[string]*v1.StatefulSet
-	Events       map[string][]*corev1.Event
 	Endpoints    map[string]*corev1.Endpoints
+	Events       map[string]map[string][]*corev1.Event // key: Kind, key inside: name
 	UpdateAT     time.Time
 
 	sync.RWMutex // todo
@@ -1556,7 +1562,13 @@ func (d *DataSet) deleteStateful(data *v1.StatefulSet) {
 }
 
 func (d *DataSet) upsertEvent(data *corev1.Event) {
-	events, ok := d.Events[data.Name]
+	kind := data.InvolvedObject.Kind
+	kinds, ok := d.Events[kind]
+	if !ok {
+		kinds = make(map[string][]*corev1.Event, 5)
+	}
+
+	events, ok := kinds[data.Name]
 	if !ok {
 		events = make([]*corev1.Event, 0, 5)
 	}
@@ -1565,12 +1577,13 @@ func (d *DataSet) upsertEvent(data *corev1.Event) {
 		events = events[20:]
 	}
 	events = append(events, data)
-	d.Events[data.Name] = events
+	kinds[data.Name] = events
+	d.Events[kind] = kinds
 	d.updateTime()
 }
 
 func (d *DataSet) deleteEvent(data *corev1.Event) {
-	delete(d.Events, data.Name)
+	delete(d.Events, data.Kind)
 	d.updateTime()
 }
 
@@ -1636,12 +1649,13 @@ func (d *DataSet) CopyDaemons() map[string]*v1.DaemonSet {
 	return resp
 }
 
-func (d *DataSet) CopyEvents() map[string][]*corev1.Event {
-	resp := make(map[string][]*corev1.Event, len(d.Events))
-	for key, src := range d.Events {
-		// elist := make([]*corev1.Event, len(src))
-		// copy(src, elist)
-		resp[key] = src // no need copy
+func (d *DataSet) CopyEvents() map[string]map[string][]*corev1.Event {
+	resp := make(map[string]map[string][]*corev1.Event, len(d.Events))
+	for kind, names := range d.Events {
+		resp[kind] = make(map[string][]*corev1.Event, len(names))
+		for name, evs := range names {
+			resp[kind][name] = evs
+		}
 	}
 	return resp
 }

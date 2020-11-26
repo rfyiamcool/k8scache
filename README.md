@@ -11,12 +11,13 @@ local cache for kubernetes apiserver cache
 - namespace
 - pod
 - node
-- service 
+- service
 - replicaSet
 - deployment
 - daemonSet
 - statefulSet
-- event 
+- event
+- endpoints
 
 ### Usage
 

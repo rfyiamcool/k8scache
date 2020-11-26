@@ -1,6 +1,8 @@
 package k8scache
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -61,7 +63,8 @@ func TestSimple(t *testing.T) {
 	evs, err := cc.GetAllEvents("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(evs), 0)
-	// fmt.Printf("%+v", evs)
+	bs, err := json.Marshal(evs)
+	fmt.Println(string(bs))
 
 	ends, err := cc.GetAllEndpoints("default")
 	assert.Equal(t, err, nil)
@@ -77,22 +80,22 @@ func TestSimple(t *testing.T) {
 	assert.Greater(t, len(nodes), 0)
 	// fmt.Printf("nodes list %v \n\n", nodes)
 
-	mpods, err := cc.GetPodsWithNS("default")
+	mpods, err := cc.GetPods("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(mpods), 0)
 	// fmt.Printf("default pods list %v \n\n", mpods)
 
-	svcs, err := cc.GetServices("default")
+	svcs, err := cc.GetAllServices("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(svcs), 0)
 	// fmt.Printf("default services list %v \n\n", svcs)
 
-	reps, err := cc.GetReplicas("default")
+	reps, err := cc.GetAllReplicas("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(reps), 0)
 	// fmt.Printf("default replicas list %v \n\n", reps)
 
-	dms, err := cc.GetDeployments("default")
+	dms, err := cc.GetAllDeployments("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(dms), 0)
 	// fmt.Printf("default deployments list %v \n\n", dms)
