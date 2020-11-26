@@ -30,36 +30,34 @@ const (
 	TypeDeployment  = "Deployment"
 	TypeDaemonSet   = "DaemonSet"
 	TypeStatefulSet = "StatefulSet"
+	TypeEvent       = "Event"
 )
 
 var (
 	ErrNotFoundNamespace   = errors.New("not found namespace")
 	ErrNotFoundName        = errors.New("not found name")
 	ErrSyncResourceTimeout = errors.New("sync resource timeout")
+	ErrCacheNotReady       = errors.New("cache not ready, wait to sync full cache in the beginning")
 
-	allResources = map[string]bool{
-		TypeNamespace:   true,
-		TypePod:         true,
-		TypeNode:        true,
-		TypeService:     true,
-		TypeReplicaSet:  true,
-		TypeDeployment:  true,
-		TypeDaemonSet:   true,
-		TypeStatefulSet: true,
+	allResources = []string{
+		TypeNamespace,
+		TypePod,
+		TypeNode,
+		TypeService,
+		TypeReplicaSet,
+		TypeDeployment,
+		TypeDaemonSet,
+		TypeStatefulSet,
+		TypeEvent,
 	}
 )
 
 type Client struct {
-	config *rest.Config
 	client *kubernetes.Clientset
 }
 
 func NewClient() (*Client, error) {
 	return &Client{}, nil
-}
-
-func (cs *Client) GetConfig() *rest.Config {
-	return cs.config
 }
 
 func (cs *Client) GetClient() *kubernetes.Clientset {
@@ -77,24 +75,22 @@ func (cs *Client) BuildForKubecfg() error {
 }
 
 func (cs *Client) BuildForCustomKubecfg(kubecfg string) error {
-	var err error
-	cs.config, err = clientcmd.BuildConfigFromFlags("", kubecfg)
+	config, err := clientcmd.BuildConfigFromFlags("", kubecfg)
 	if err != nil {
 		return err
 	}
 
-	cs.client, err = kubernetes.NewForConfig(cs.config)
+	cs.client, err = kubernetes.NewForConfig(config)
 	return err
 }
 
 func (cs *Client) BuildForInCluster(kubecfg string) error {
-	var err error
-	cs.config, err = rest.InClusterConfig()
+	config, err := rest.InClusterConfig()
 	if err != nil {
 		return err
 	}
 
-	cs.client, err = kubernetes.NewForConfig(cs.config)
+	cs.client, err = kubernetes.NewForConfig(config)
 	return err
 }
 
@@ -121,7 +117,6 @@ func (cs *Client) BuildForParams(addr, token, cert, key, ca string) error {
 		return err
 	}
 
-	cs.config = cfg
 	cs.client = clientSet
 	return nil
 }
@@ -173,14 +168,35 @@ func WithNotFollowResource(rlist []string) OptionFunc {
 	}
 }
 
+func WithFollowNamespaces(nlist []string) OptionFunc {
+	return func(o *ClusterCache) error {
+		mm := map[string]bool{}
+		for _, ns := range nlist {
+			mm[ns] = true
+		}
+		o.followNamespaces = mm // cover old val
+		return nil
+	}
+}
+
+func WithNotFollowNamespaces(nlist []string) OptionFunc {
+	return func(o *ClusterCache) error {
+		for _, ns := range nlist {
+			delete(o.followNamespaces, ns)
+		}
+		return nil
+	}
+}
+
 func NewClusterCache(client *Client, opts ...OptionFunc) (*ClusterCache, error) {
 	cc := &ClusterCache{
-		k8sClient:      client,
-		stopper:        make(chan struct{}, 0),
-		cache:          make(map[string]*DataSet, 5),
-		nodes:          make(map[string]*corev1.Node, 5),
-		namespaces:     make(map[string]*corev1.Namespace, 5),
-		followResource: allResources,
+		k8sClient:        client,
+		stopper:          make(chan struct{}, 0),
+		cache:            make(map[string]*DataSet, 5),
+		nodes:            make(map[string]*corev1.Node, 5),
+		namespaces:       make(map[string]*corev1.Namespace, 5),
+		followResource:   getAllResources(),
+		followNamespaces: make(map[string]bool, 0),
 	}
 	for _, opt := range opts {
 		err := opt(cc)
@@ -192,11 +208,13 @@ func NewClusterCache(client *Client, opts ...OptionFunc) (*ClusterCache, error) 
 }
 
 type ClusterCache struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	namespace      string
-	k8sClient      *Client
-	followResource map[string]bool
+	ctx              context.Context
+	cancel           context.CancelFunc
+	namespace        string
+	k8sClient        *Client
+	followResource   map[string]bool
+	followNamespaces map[string]bool
+	isReady          bool // todo: all resource -> map[resource]bool
 
 	stopper  chan struct{}
 	stopOnce sync.Once
@@ -210,6 +228,7 @@ type ClusterCache struct {
 	replicaInformer    cache.SharedIndexInformer
 	daemonInformer     cache.SharedIndexInformer
 	statefulInformer   cache.SharedIndexInformer
+	eventInformer      cache.SharedIndexInformer
 
 	nodes      map[string]*corev1.Node
 	namespaces map[string]*corev1.Namespace
@@ -248,7 +267,7 @@ func (c *ClusterCache) Reset() {
 
 func (c *ClusterCache) isClosed() bool {
 	select {
-	case <-c.ctx.Done():
+	case <-c.stopper:
 		return true
 	default:
 		return false
@@ -257,6 +276,15 @@ func (c *ClusterCache) isClosed() bool {
 
 func (c *ClusterCache) isFollowResource(res string) bool {
 	_, ok := c.followResource[res]
+	return ok
+}
+
+func (c *ClusterCache) isFollowNamespace(ns string) bool {
+	if len(c.followNamespaces) == 0 { // unset
+		return true
+	}
+
+	_, ok := c.followNamespaces[ns]
 	return ok
 }
 
@@ -269,15 +297,10 @@ func (c *ClusterCache) bindResourceInformer() {
 	c.bindDeploymentInformer()
 	c.bindStatefulInformer()
 	c.bindDaemonInformer()
+	c.bindEventInformer()
 }
 
-var (
-	defaultSyncTimeout = time.Duration(30 * time.Second)
-)
-
-func (c *ClusterCache) SyncCache() error {
-	return c.SyncCacheWithTimeout(defaultSyncTimeout)
-}
+var defaultSyncTimeout = time.Duration(30 * time.Second)
 
 func (c *ClusterCache) timeoutChan(ts time.Duration) (chan struct{}, *time.Timer) {
 	done := make(chan struct{})
@@ -289,6 +312,10 @@ func (c *ClusterCache) timeoutChan(ts time.Duration) (chan struct{}, *time.Timer
 		close(done)
 	})
 	return done, timer
+}
+
+func (c *ClusterCache) SyncCache() error {
+	return c.SyncCacheWithTimeout(defaultSyncTimeout)
 }
 
 func (c *ClusterCache) SyncCacheWithTimeout(timeout time.Duration) error {
@@ -306,9 +333,10 @@ func (c *ClusterCache) SyncCacheWithTimeout(timeout time.Duration) error {
 		c.SyncReplicasCache,
 		c.SyncDaemonCache,
 		c.SyncStatefulCache,
+		c.SyncEventsCache,
 	)
 
-	wg := sync.WaitGroup{}
+	wg := sync.WaitGroup{} // concurrent sync
 	for _, fn := range funcs {
 		fn := fn // avoid go for range bug
 
@@ -323,6 +351,9 @@ func (c *ClusterCache) SyncCacheWithTimeout(timeout time.Duration) error {
 	}
 	wg.Wait()
 
+	if err == nil {
+		c.isReady = true
+	}
 	return err
 }
 
@@ -331,6 +362,9 @@ func (c *ClusterCache) bindNamespaceInformer() {
 	add := func(obj interface{}) {
 		ns, ok := obj.(*corev1.Namespace)
 		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(ns.Namespace) {
 			return
 		}
 
@@ -345,6 +379,9 @@ func (c *ClusterCache) bindNamespaceInformer() {
 	del := func(obj interface{}) {
 		ns, ok := obj.(*corev1.Namespace)
 		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(ns.Namespace) {
 			return
 		}
 
@@ -386,6 +423,9 @@ func (c *ClusterCache) bindPodInformer() {
 		if !ok {
 			return
 		}
+		if !c.isFollowNamespace(pod.Namespace) {
+			return
+		}
 
 		c.cacheMutex.Lock()
 		defer c.cacheMutex.Unlock()
@@ -404,6 +444,9 @@ func (c *ClusterCache) bindPodInformer() {
 	del := func(obj interface{}) {
 		pod, ok := obj.(*corev1.Pod)
 		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(pod.Namespace) {
 			return
 		}
 
@@ -495,6 +538,9 @@ func (c *ClusterCache) bindServiceInformer() {
 		if !ok {
 			return
 		}
+		if !c.isFollowNamespace(value.Namespace) {
+			return
+		}
 
 		c.cacheMutex.Lock()
 		defer c.cacheMutex.Unlock()
@@ -514,6 +560,9 @@ func (c *ClusterCache) bindServiceInformer() {
 	del := func(obj interface{}) {
 		value, ok := obj.(*corev1.Service)
 		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(value.Namespace) {
 			return
 		}
 
@@ -560,6 +609,9 @@ func (c *ClusterCache) bindDeploymentInformer() {
 		if !ok {
 			return
 		}
+		if !c.isFollowNamespace(value.Namespace) {
+			return
+		}
 
 		c.cacheMutex.Lock()
 		defer c.cacheMutex.Unlock()
@@ -579,6 +631,9 @@ func (c *ClusterCache) bindDeploymentInformer() {
 	del := func(obj interface{}) {
 		value, ok := obj.(*corev1.Service)
 		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(value.Namespace) {
 			return
 		}
 
@@ -624,6 +679,9 @@ func (c *ClusterCache) bindReplicaInformer() {
 		if !ok {
 			return
 		}
+		if !c.isFollowNamespace(value.Namespace) {
+			return
+		}
 
 		c.cacheMutex.Lock()
 		defer c.cacheMutex.Unlock()
@@ -642,6 +700,9 @@ func (c *ClusterCache) bindReplicaInformer() {
 	del := func(obj interface{}) {
 		value, ok := obj.(*v1.ReplicaSet)
 		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(value.Namespace) {
 			return
 		}
 
@@ -685,6 +746,9 @@ func (c *ClusterCache) bindStatefulInformer() {
 	add := func(obj interface{}) {
 		value, ok := obj.(*v1.StatefulSet)
 		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(value.Namespace) {
 			return
 		}
 
@@ -750,6 +814,9 @@ func (c *ClusterCache) bindDaemonInformer() {
 		if !ok {
 			return
 		}
+		if !c.isFollowNamespace(value.Namespace) {
+			return
+		}
 
 		c.cacheMutex.Lock()
 		defer c.cacheMutex.Unlock()
@@ -768,6 +835,9 @@ func (c *ClusterCache) bindDaemonInformer() {
 	del := func(obj interface{}) {
 		value, ok := obj.(*v1.DaemonSet)
 		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(value.Namespace) {
 			return
 		}
 
@@ -802,26 +872,95 @@ func (c *ClusterCache) SyncDaemonCache(timeout time.Duration) error {
 	return nil
 }
 
-func (c *ClusterCache) ListDeployments() (*v1.DeploymentList, error) {
-	items, err := c.k8sClient.client.AppsV1().Deployments(c.namespace).List(metav1.ListOptions{})
+func (c *ClusterCache) bindEventInformer() {
+	if !c.isFollowResource(TypePod) {
+		return
+	}
+
+	c.eventInformer = c.factory.Core().V1().Events().Informer()
+	add := func(obj interface{}) {
+		value, ok := obj.(*corev1.Event)
+		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(value.Namespace) {
+			return
+		}
+
+		c.cacheMutex.Lock()
+		defer c.cacheMutex.Unlock()
+
+		data, ok := c.cache[value.Namespace]
+		if !ok {
+			data = newDataSet(value.Namespace)
+			c.cache[value.Namespace] = data
+		}
+
+		data.upsertEvent(value)
+	}
+	update := func(oldObj, newObj interface{}) {
+		add(newObj)
+	}
+	del := func(obj interface{}) {
+		value, ok := obj.(*corev1.Event)
+		if !ok {
+			return
+		}
+		if !c.isFollowNamespace(value.Namespace) {
+			return
+		}
+
+		c.cacheMutex.Lock()
+		defer c.cacheMutex.Unlock()
+
+		data, ok := c.cache[value.Namespace]
+		if !ok {
+			return
+		}
+		data.deleteEvent(value)
+	}
+
+	c.eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    add,
+		UpdateFunc: update,
+		DeleteFunc: del,
+	})
+}
+
+func (c *ClusterCache) SyncEventsCache(timeout time.Duration) error {
+	if !c.isFollowResource(TypeEvent) {
+		return nil
+	}
+
+	done, timer := c.timeoutChan(timeout)
+	defer timer.Stop()
+
+	if !cache.WaitForCacheSync(done, c.eventInformer.HasSynced) {
+		return ErrSyncResourceTimeout
+	}
+	return nil
+}
+
+func (c *ClusterCache) ListDeployments(ns string) (*v1.DeploymentList, error) {
+	items, err := c.k8sClient.client.AppsV1().Deployments(ns).List(metav1.ListOptions{})
 	return items, err
 }
 
-func (c *ClusterCache) WatchDeployments() (<-chan watch.Event, error) {
-	watcher, err := c.k8sClient.client.AppsV1().Deployments(c.namespace).Watch(metav1.ListOptions{})
+func (c *ClusterCache) WatchDeployments(ns string) (<-chan watch.Event, error) {
+	watcher, err := c.k8sClient.client.AppsV1().Deployments(ns).Watch(metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 	return watcher.ResultChan(), nil
 }
 
-func (c *ClusterCache) ListReplicaSets() (*v1.ReplicaSetList, error) {
-	items, err := c.k8sClient.client.AppsV1().ReplicaSets(metav1.NamespaceDefault).List(metav1.ListOptions{})
+func (c *ClusterCache) ListReplicaSets(ns string) (*v1.ReplicaSetList, error) {
+	items, err := c.k8sClient.client.AppsV1().ReplicaSets(ns).List(metav1.ListOptions{})
 	return items, err
 }
 
-func (c *ClusterCache) WatchReplicaSets() (<-chan watch.Event, error) {
-	watcher, err := c.k8sClient.client.AppsV1().ReplicaSets(c.namespace).Watch(metav1.ListOptions{})
+func (c *ClusterCache) WatchReplicaSets(ns string) (<-chan watch.Event, error) {
+	watcher, err := c.k8sClient.client.AppsV1().ReplicaSets(ns).Watch(metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -829,26 +968,26 @@ func (c *ClusterCache) WatchReplicaSets() (<-chan watch.Event, error) {
 	return watcher.ResultChan(), nil
 }
 
-func (c *ClusterCache) ListPods() (*corev1.PodList, error) {
+func (c *ClusterCache) ListPods(ns string) (*corev1.PodList, error) {
 	items, err := c.k8sClient.client.CoreV1().Pods(c.namespace).List(metav1.ListOptions{})
 	return items, err
 }
 
-func (c *ClusterCache) WatchPods() (<-chan watch.Event, error) {
-	watcher, err := c.k8sClient.client.CoreV1().Pods(c.namespace).Watch(metav1.ListOptions{})
+func (c *ClusterCache) WatchPods(ns string) (<-chan watch.Event, error) {
+	watcher, err := c.k8sClient.client.CoreV1().Pods(ns).Watch(metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 	return watcher.ResultChan(), nil
 }
 
-func (c *ClusterCache) ListServices() (*corev1.ServiceList, error) {
-	items, err := c.k8sClient.client.CoreV1().Services(c.namespace).List(metav1.ListOptions{})
+func (c *ClusterCache) ListServices(ns string) (*corev1.ServiceList, error) {
+	items, err := c.k8sClient.client.CoreV1().Services(ns).List(metav1.ListOptions{})
 	return items, err
 }
 
-func (c *ClusterCache) WatchServices() (<-chan watch.Event, error) {
-	watcher, err := c.k8sClient.client.CoreV1().Services(c.namespace).Watch(metav1.ListOptions{})
+func (c *ClusterCache) WatchServices(ns string) (<-chan watch.Event, error) {
+	watcher, err := c.k8sClient.client.CoreV1().Services(ns).Watch(metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -856,7 +995,35 @@ func (c *ClusterCache) WatchServices() (<-chan watch.Event, error) {
 	return watcher.ResultChan(), nil
 }
 
+func (c *ClusterCache) ListEvents(ns string) (*corev1.EventList, error) {
+	items, err := c.k8sClient.client.CoreV1().Events(ns).List(metav1.ListOptions{})
+	return items, err
+}
+
+func (c *ClusterCache) WatchEvents(ns string) (<-chan watch.Event, error) {
+	watcher, err := c.k8sClient.client.CoreV1().Events(ns).Watch(metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return watcher.ResultChan(), nil
+}
+
+func (c *ClusterCache) beforeValidate() error {
+	if !c.isReady {
+		return ErrCacheNotReady
+	}
+	return nil
+}
+
 func (c *ClusterCache) GetNodes() (map[string]*corev1.Node, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+
 	ret := make(map[string]*corev1.Node, len(c.nodes))
 	for name, node := range c.nodes {
 		ret[name] = node
@@ -864,10 +1031,7 @@ func (c *ClusterCache) GetNodes() (map[string]*corev1.Node, error) {
 	return ret, nil
 }
 
-func (c *ClusterCache) GetUpdateTimeWithNs(ns string) (time.Time, error) {
-	c.cacheMutex.Lock()
-	defer c.cacheMutex.Unlock()
-
+func (c *ClusterCache) GetUpdateTime(ns string) (time.Time, error) {
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -880,6 +1044,10 @@ func (c *ClusterCache) GetUpdateTimeWithNs(ns string) (time.Time, error) {
 }
 
 func (c *ClusterCache) GetNamespaces() (map[string]*corev1.Namespace, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -891,6 +1059,10 @@ func (c *ClusterCache) GetNamespaces() (map[string]*corev1.Namespace, error) {
 }
 
 func (c *ClusterCache) GetPodsWithNS(ns string) (map[string]*corev1.Pod, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -903,7 +1075,11 @@ func (c *ClusterCache) GetPodsWithNS(ns string) (map[string]*corev1.Pod, error) 
 	return data.CopyPods(), nil
 }
 
-func (c *ClusterCache) GetPodWithNS(ns string, name string) (*corev1.Pod, error) {
+func (c *ClusterCache) GetPod(ns string, name string) (*corev1.Pod, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -920,7 +1096,11 @@ func (c *ClusterCache) GetPodWithNS(ns string, name string) (*corev1.Pod, error)
 	return pod, nil
 }
 
-func (c *ClusterCache) GetServicesWithNS(ns string) (map[string]*corev1.Service, error) {
+func (c *ClusterCache) GetServices(ns string) (map[string]*corev1.Service, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -933,7 +1113,11 @@ func (c *ClusterCache) GetServicesWithNS(ns string) (map[string]*corev1.Service,
 	return data.CopyServices(), nil
 }
 
-func (c *ClusterCache) GetServiceWithNS(ns string, name string) (*corev1.Service, error) {
+func (c *ClusterCache) GetService(ns string, name string) (*corev1.Service, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -950,7 +1134,11 @@ func (c *ClusterCache) GetServiceWithNS(ns string, name string) (*corev1.Service
 	return service, nil
 }
 
-func (c *ClusterCache) GetDeploymentsWithNS(ns string) (map[string]*v1.Deployment, error) {
+func (c *ClusterCache) GetDeployments(ns string) (map[string]*v1.Deployment, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -963,7 +1151,11 @@ func (c *ClusterCache) GetDeploymentsWithNS(ns string) (map[string]*v1.Deploymen
 	return data.CopyDeployments(), nil
 }
 
-func (c *ClusterCache) GetDeploymentWithNS(ns string, name string) (*v1.Deployment, error) {
+func (c *ClusterCache) GetDeployment(ns string, name string) (*v1.Deployment, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -980,7 +1172,11 @@ func (c *ClusterCache) GetDeploymentWithNS(ns string, name string) (*v1.Deployme
 	return dm, nil
 }
 
-func (c *ClusterCache) GetReplicasWithNS(ns string) (map[string]*v1.ReplicaSet, error) {
+func (c *ClusterCache) GetReplicas(ns string) (map[string]*v1.ReplicaSet, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -993,7 +1189,11 @@ func (c *ClusterCache) GetReplicasWithNS(ns string) (map[string]*v1.ReplicaSet, 
 	return data.CopyReplicas(), nil
 }
 
-func (c *ClusterCache) GetReplicaWithNS(ns string, name string) (*v1.ReplicaSet, error) {
+func (c *ClusterCache) GetReplica(ns string, name string) (*v1.ReplicaSet, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -1010,6 +1210,82 @@ func (c *ClusterCache) GetReplicaWithNS(ns string, name string) (*v1.ReplicaSet,
 	return rep, nil
 }
 
+func (c *ClusterCache) GetDaemons(ns string) (map[string]*v1.DaemonSet, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+
+	data, ok := c.cache[ns]
+	if !ok {
+		return nil, ErrNotFoundNamespace
+	}
+
+	// copy
+	return data.CopyDaemons(), nil
+}
+
+func (c *ClusterCache) GetDaemon(ns string, name string) (*v1.DaemonSet, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+
+	data, ok := c.cache[ns]
+	if !ok {
+		return nil, ErrNotFoundNamespace
+	}
+
+	rep, ok := data.Daemons[name]
+	if !ok {
+		return nil, ErrNotFoundName
+	}
+
+	return rep, nil
+}
+
+func (c *ClusterCache) GetStatefuls(ns string) (map[string]*v1.StatefulSet, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+
+	data, ok := c.cache[ns]
+	if !ok {
+		return nil, ErrNotFoundNamespace
+	}
+
+	// copy
+	return data.CopyStatefuls(), nil
+}
+
+func (c *ClusterCache) GetStateful(ns string, name string) (*v1.StatefulSet, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+
+	data, ok := c.cache[ns]
+	if !ok {
+		return nil, ErrNotFoundNamespace
+	}
+
+	rep, ok := data.StatefulSets[name]
+	if !ok {
+		return nil, ErrNotFoundName
+	}
+
+	return rep, nil
+}
+
 func newDataSet(ns string) *DataSet {
 	return &DataSet{
 		Namespace:    ns,
@@ -1019,6 +1295,7 @@ func newDataSet(ns string) *DataSet {
 		Replicas:     make(map[string]*v1.ReplicaSet, 10),
 		Daemons:      make(map[string]*v1.DaemonSet, 10),
 		StatefulSets: make(map[string]*v1.StatefulSet, 10),
+		Events:       make(map[string][]*corev1.Event, 10),
 	}
 }
 
@@ -1030,6 +1307,7 @@ type DataSet struct {
 	Replicas     map[string]*v1.ReplicaSet  // ...
 	Daemons      map[string]*v1.DaemonSet
 	StatefulSets map[string]*v1.StatefulSet
+	Events       map[string][]*corev1.Event
 	UpdateAT     time.Time
 
 	sync.RWMutex // todo
@@ -1095,6 +1373,25 @@ func (d *DataSet) deleteStateful(data *v1.StatefulSet) {
 	d.updateTime()
 }
 
+func (d *DataSet) upsertEvent(data *corev1.Event) {
+	events, ok := d.Events[data.Name]
+	if !ok {
+		events = make([]*corev1.Event, 0, 5)
+	}
+	// reduce
+	if len(events) > 50 {
+		events = events[20:]
+	}
+	events = append(events, data)
+	d.Events[data.Name] = events
+	d.updateTime()
+}
+
+func (d *DataSet) deleteEvent(data *corev1.Event) {
+	delete(d.Events, data.Name)
+	d.updateTime()
+}
+
 func (d *DataSet) updateTime() {
 	d.UpdateAT = time.Now()
 }
@@ -1131,6 +1428,30 @@ func (d *DataSet) CopyDeployments() map[string]*v1.Deployment {
 	return resp
 }
 
+func (d *DataSet) CopyStatefuls() map[string]*v1.StatefulSet {
+	resp := make(map[string]*v1.StatefulSet, len(d.StatefulSets))
+	for key, val := range d.StatefulSets {
+		resp[key] = val
+	}
+	return resp
+}
+
+func (d *DataSet) CopyDaemons() map[string]*v1.DaemonSet {
+	resp := make(map[string]*v1.DaemonSet, len(d.Daemons))
+	for key, val := range d.Daemons {
+		resp[key] = val
+	}
+	return resp
+}
+
 func int32Ptr2(i int32) *int32 {
 	return &i
+}
+
+func getAllResources() map[string]bool {
+	ret := map[string]bool{}
+	for _, res := range allResources {
+		ret[res] = true
+	}
+	return ret
 }

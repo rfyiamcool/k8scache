@@ -28,7 +28,15 @@ func TestTimout(t *testing.T) {
 	assert.Less(t, float64(0), time.Since(start2).Seconds())
 }
 
-func TestSimple(t *testing.T) {
+func TestNotReady(t *testing.T) {
+	cc, err := NewClusterCache(nil)
+	assert.Equal(t, err, nil)
+
+	_, err = cc.GetNamespaces()
+	assert.Equal(t, err, ErrCacheNotReady)
+}
+
+func newTestClient(t *testing.T) *ClusterCache {
 	cli, err := NewClient()
 	assert.Equal(t, err, nil)
 
@@ -37,13 +45,19 @@ func TestSimple(t *testing.T) {
 
 	cc, err := NewClusterCache(cli)
 	assert.Equal(t, err, nil)
+	return cc
+}
 
-	pods, err := cc.ListPods()
+func TestSimple(t *testing.T) {
+	cc := newTestClient(t)
+	pods, err := cc.ListPods("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(pods.Items), 0)
 
 	cc.Start()
 	cc.SyncCache()
+
+	// evs, err := cc.ListEvents("default")
 
 	nslist, err := cc.GetNamespaces()
 	assert.Equal(t, err, nil)
@@ -60,17 +74,17 @@ func TestSimple(t *testing.T) {
 	assert.Greater(t, len(mpods), 0)
 	fmt.Printf("default pods list %v \n\n", mpods)
 
-	svcs, err := cc.GetServicesWithNS("default")
+	svcs, err := cc.GetServices("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(svcs), 0)
 	fmt.Printf("default services list %v \n\n", svcs)
 
-	reps, err := cc.GetReplicasWithNS("default")
+	reps, err := cc.GetReplicas("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(reps), 0)
 	fmt.Printf("default replicas list %v \n\n", reps)
 
-	dms, err := cc.GetDeploymentsWithNS("default")
+	dms, err := cc.GetDeployments("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(dms), 0)
 	fmt.Printf("default deployments list %v \n\n", dms)
