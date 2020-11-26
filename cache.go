@@ -995,6 +995,34 @@ func (c *ClusterCache) WatchServices(ns string) (<-chan watch.Event, error) {
 	return watcher.ResultChan(), nil
 }
 
+func (c *ClusterCache) ListStatefuls(ns string) (*v1.StatefulSetList, error) {
+	items, err := c.k8sClient.client.AppsV1().StatefulSets(ns).List(metav1.ListOptions{})
+	return items, err
+}
+
+func (c *ClusterCache) WatchStatefuls(ns string) (<-chan watch.Event, error) {
+	watcher, err := c.k8sClient.client.AppsV1().StatefulSets(ns).Watch(metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return watcher.ResultChan(), nil
+}
+
+func (c *ClusterCache) ListDaemons(ns string) (*v1.DaemonSetList, error) {
+	items, err := c.k8sClient.client.AppsV1().DaemonSets(ns).List(metav1.ListOptions{})
+	return items, err
+}
+
+func (c *ClusterCache) WatchDaemons(ns string) (<-chan watch.Event, error) {
+	watcher, err := c.k8sClient.client.AppsV1().DaemonSets(ns).Watch(metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return watcher.ResultChan(), nil
+}
+
 func (c *ClusterCache) ListEvents(ns string) (*corev1.EventList, error) {
 	items, err := c.k8sClient.client.CoreV1().Events(ns).List(metav1.ListOptions{})
 	return items, err

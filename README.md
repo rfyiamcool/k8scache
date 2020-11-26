@@ -16,6 +16,7 @@ local cache for kubernetes apiserver cache
 - deployment
 - daemonSet
 - statefulSet
+- event 
 
 ### Usage
 
