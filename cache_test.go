@@ -1,7 +1,6 @@
 package k8scache
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -59,35 +58,44 @@ func TestSimple(t *testing.T) {
 
 	// evs, err := cc.ListEvents("default")
 
+	evs, err := cc.GetAllEvents("default")
+	assert.Equal(t, err, nil)
+	assert.Greater(t, len(evs), 0)
+	// fmt.Printf("%+v", evs)
+
+	ends, err := cc.GetAllEndpoints("default")
+	assert.Equal(t, err, nil)
+	assert.Greater(t, len(ends), 0)
+
 	nslist, err := cc.GetNamespaces()
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(nslist), 0)
-	fmt.Printf("namespace list %v \n\n", nslist)
+	// fmt.Printf("namespace list %v \n\n", nslist)
 
 	nodes, err := cc.GetNodes()
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(nodes), 0)
-	fmt.Printf("nodes list %v \n\n", nodes)
+	// fmt.Printf("nodes list %v \n\n", nodes)
 
 	mpods, err := cc.GetPodsWithNS("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(mpods), 0)
-	fmt.Printf("default pods list %v \n\n", mpods)
+	// fmt.Printf("default pods list %v \n\n", mpods)
 
 	svcs, err := cc.GetServices("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(svcs), 0)
-	fmt.Printf("default services list %v \n\n", svcs)
+	// fmt.Printf("default services list %v \n\n", svcs)
 
 	reps, err := cc.GetReplicas("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(reps), 0)
-	fmt.Printf("default replicas list %v \n\n", reps)
+	// fmt.Printf("default replicas list %v \n\n", reps)
 
 	dms, err := cc.GetDeployments("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(dms), 0)
-	fmt.Printf("default deployments list %v \n\n", dms)
+	// fmt.Printf("default deployments list %v \n\n", dms)
 
 	time.AfterFunc(1*time.Second, func() {
 		cc.Stop()
