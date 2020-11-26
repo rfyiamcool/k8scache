@@ -80,7 +80,7 @@ func TestSimple(t *testing.T) {
 	assert.Greater(t, len(nodes), 0)
 	// fmt.Printf("nodes list %v \n\n", nodes)
 
-	mpods, err := cc.GetPods("default")
+	mpods, err := cc.GetAllPods("default")
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(mpods), 0)
 	// fmt.Printf("default pods list %v \n\n", mpods)
