@@ -49,6 +49,16 @@ func newTestClient(t *testing.T) *ClusterCache {
 	return cc
 }
 
+func TestList(t *testing.T) {
+	cc := newTestClient(t)
+	pods, err := cc.ListPods("default")
+	assert.Equal(t, err, nil)
+	assert.Greater(t, len(pods.Items), 0)
+
+	cc.Start()
+	cc.SyncCache()
+}
+
 func TestSimple(t *testing.T) {
 	cc := newTestClient(t)
 	pods, err := cc.ListPods("default")

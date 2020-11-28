@@ -11,8 +11,11 @@ import (
 
 	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	listappv1 "k8s.io/client-go/listers/apps/v1"
+	listcorev1 "k8s.io/client-go/listers/core/v1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -35,10 +38,11 @@ const (
 )
 
 var (
-	ErrNotFoundNamespace   = errors.New("not found namespace")
-	ErrNotFoundName        = errors.New("not found name")
-	ErrSyncResourceTimeout = errors.New("sync resource timeout")
-	ErrCacheNotReady       = errors.New("cache not ready, wait to sync full cache in the beginning")
+	ErrNotFoundNamespace    = errors.New("not found namespace")
+	ErrNotFoundName         = errors.New("not found name")
+	ErrSyncResourceTimeout  = errors.New("sync resource timeout")
+	ErrCacheNotReady        = errors.New("cache not ready, wait to sync full cache in the beginning")
+	ErrBeyondExpireInterval = errors.New("beyond expire interval")
 
 	allResources = []string{
 		TypeNamespace,
@@ -217,21 +221,33 @@ type ClusterCache struct {
 	followResource   map[string]bool
 	followNamespaces map[string]bool
 	isReady          bool // todo: all resource -> map[resource]bool
+	isExpired        bool
+	listeners        ListenerPool
 
 	stopper  chan struct{}
 	stopOnce sync.Once
 
 	factory            informers.SharedInformerFactory
 	namespaceInformer  cache.SharedIndexInformer
+	namespaceLister    listcorev1.NamespaceLister
 	podInformer        cache.SharedIndexInformer
+	podLister          listcorev1.PodLister
 	nodeInformer       cache.SharedIndexInformer
+	nodeLister         listcorev1.NodeLister
 	serviceInformer    cache.SharedIndexInformer
+	serviceLister      listcorev1.ServiceLister
 	deploymentInformer cache.SharedIndexInformer
+	deploymentLister   listappv1.DeploymentLister
 	replicaInformer    cache.SharedIndexInformer
+	replicaLister      listappv1.ReplicaSetLister
 	daemonInformer     cache.SharedIndexInformer
+	daemonLister       listappv1.DaemonSetLister
 	statefulInformer   cache.SharedIndexInformer
+	statefulLister     listappv1.StatefulSetLister
 	eventInformer      cache.SharedIndexInformer
+	eventLister        listcorev1.EventLister
 	endpointInformer   cache.SharedIndexInformer
+	endpointLister     listcorev1.EndpointsLister
 
 	nodes      map[string]*corev1.Node
 	namespaces map[string]*corev1.Namespace
@@ -243,6 +259,7 @@ func (c *ClusterCache) Start() {
 	c.factory = informers.NewSharedInformerFactory(c.k8sClient.client, 0)
 	c.bindResourceInformer()
 	c.factory.Start(c.stopper)
+	go c.healthScaner()
 }
 
 func (c *ClusterCache) Wait() {
@@ -266,6 +283,29 @@ func (c *ClusterCache) Stop() {
 func (c *ClusterCache) Reset() {
 	c.stopper = make(chan struct{}, 0)
 	c.stopOnce = sync.Once{}
+}
+
+func (c *ClusterCache) RegisterListener(lis Listener) {
+	c.listeners.add(lis)
+}
+
+func (c *ClusterCache) UnRegisterListener(lis Listener) {
+	c.listeners.del(lis)
+}
+
+func (c *ClusterCache) healthScaner() {
+	for {
+		select {
+		case <-c.stopper:
+			return
+		case <-time.After(5 * time.Second):
+		}
+
+		_, err := c.k8sClient.client.CoreV1().Namespaces().Get(metav1.NamespaceDefault, metav1.GetOptions{})
+		if err != nil {
+			c.isExpired = true
+		}
+	}
 }
 
 func (c *ClusterCache) isClosed() bool {
@@ -362,8 +402,13 @@ func (c *ClusterCache) SyncCacheWithTimeout(timeout time.Duration) error {
 	return err
 }
 
+func (c *ClusterCache) Labels(mm map[string]string) labels.Selector {
+	return labels.Set(mm).AsSelector()
+}
+
 func (c *ClusterCache) bindNamespaceInformer() {
 	c.namespaceInformer = c.factory.Core().V1().Namespaces().Informer()
+	c.namespaceLister = c.factory.Core().V1().Namespaces().Lister()
 	add := func(obj interface{}) {
 		ns, ok := obj.(*corev1.Namespace)
 		if !ok {
@@ -423,6 +468,8 @@ func (c *ClusterCache) bindPodInformer() {
 	}
 
 	c.podInformer = c.factory.Core().V1().Pods().Informer()
+	c.podLister = c.factory.Core().V1().Pods().Lister()
+
 	add := func(obj interface{}) {
 		pod, ok := obj.(*corev1.Pod)
 		if !ok {
@@ -430,6 +477,15 @@ func (c *ClusterCache) bindPodInformer() {
 		}
 		if !c.isFollowNamespace(pod.Namespace) {
 			return
+		}
+
+		for lis, _ := range c.listeners.copy() {
+			if lis.IsDone() {
+				c.listeners.del(lis)
+				continue
+			}
+
+			lis.Notify(obj)
 		}
 
 		c.cacheMutex.Lock()
@@ -492,6 +548,7 @@ func (c *ClusterCache) bindNodesInformer() {
 	}
 
 	c.nodeInformer = c.factory.Core().V1().Nodes().Informer()
+	c.nodeLister = c.factory.Core().V1().Nodes().Lister()
 	add := func(obj interface{}) {
 		node, ok := obj.(*corev1.Node)
 		if !ok {
@@ -538,6 +595,7 @@ func (c *ClusterCache) bindServiceInformer() {
 	}
 
 	c.serviceInformer = c.factory.Core().V1().Services().Informer()
+	c.serviceLister = c.factory.Core().V1().Services().Lister()
 	add := func(obj interface{}) {
 		value, ok := obj.(*corev1.Service)
 		if !ok {
@@ -609,6 +667,7 @@ func (c *ClusterCache) bindDeploymentInformer() {
 	}
 
 	c.deploymentInformer = c.factory.Apps().V1().Deployments().Informer()
+	c.deploymentLister = c.factory.Apps().V1().Deployments().Lister()
 	add := func(obj interface{}) {
 		value, ok := obj.(*v1.Deployment)
 		if !ok {
@@ -679,6 +738,7 @@ func (c *ClusterCache) bindReplicaInformer() {
 	}
 
 	c.replicaInformer = c.factory.Apps().V1().ReplicaSets().Informer()
+	c.replicaLister = c.factory.Apps().V1().ReplicaSets().Lister()
 	add := func(obj interface{}) {
 		value, ok := obj.(*v1.ReplicaSet)
 		if !ok {
@@ -748,6 +808,7 @@ func (c *ClusterCache) bindStatefulInformer() {
 	}
 
 	c.statefulInformer = c.factory.Apps().V1().StatefulSets().Informer()
+	c.statefulLister = c.factory.Apps().V1().StatefulSets().Lister()
 	add := func(obj interface{}) {
 		value, ok := obj.(*v1.StatefulSet)
 		if !ok {
@@ -814,6 +875,7 @@ func (c *ClusterCache) bindDaemonInformer() {
 	}
 
 	c.daemonInformer = c.factory.Apps().V1().DaemonSets().Informer()
+	c.daemonLister = c.factory.Apps().V1().DaemonSets().Lister()
 	add := func(obj interface{}) {
 		value, ok := obj.(*v1.DaemonSet)
 		if !ok {
@@ -883,6 +945,7 @@ func (c *ClusterCache) bindEventInformer() {
 	}
 
 	c.eventInformer = c.factory.Core().V1().Events().Informer()
+	c.eventLister = c.factory.Core().V1().Events().Lister()
 	add := func(obj interface{}) {
 		value, ok := obj.(*corev1.Event)
 		if !ok {
@@ -953,6 +1016,7 @@ func (c *ClusterCache) bindEndpointsInformer() {
 	}
 
 	c.endpointInformer = c.factory.Core().V1().Endpoints().Informer()
+	c.endpointLister = c.factory.Core().V1().Endpoints().Lister()
 	add := func(obj interface{}) {
 		value, ok := obj.(*corev1.Endpoints)
 		if !ok {
@@ -1116,22 +1180,18 @@ func (c *ClusterCache) beforeValidate() error {
 	if !c.isReady {
 		return ErrCacheNotReady
 	}
+	if c.isExpired {
+		return ErrBeyondExpireInterval
+	}
 	return nil
 }
 
-func (c *ClusterCache) GetNodes() (map[string]*corev1.Node, error) {
+func (c *ClusterCache) GetNodes() ([]*corev1.Node, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	ret := make(map[string]*corev1.Node, len(c.nodes))
-	for name, node := range c.nodes {
-		ret[name] = node
-	}
-	return ret, nil
+	return c.nodeLister.List(labels.Everything())
 }
 
 func (c *ClusterCache) GetUpdateTime(ns string) (time.Time, error) {
@@ -1146,36 +1206,20 @@ func (c *ClusterCache) GetUpdateTime(ns string) (time.Time, error) {
 	return data.UpdateAT, nil
 }
 
-func (c *ClusterCache) GetNamespaces() (map[string]*corev1.Namespace, error) {
+func (c *ClusterCache) GetNamespaces() ([]*corev1.Namespace, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	namespaces := make(map[string]*corev1.Namespace, len(c.namespaces))
-	for name, obj := range c.namespaces {
-		namespaces[name] = obj
-	}
-	return namespaces, nil
+	return c.namespaceLister.List(labels.Everything())
 }
 
-func (c *ClusterCache) GetAllPods(ns string) (map[string]*corev1.Pod, error) {
+func (c *ClusterCache) GetAllPods(ns string) ([]*corev1.Pod, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	// copy
-	return data.CopyPods(), nil
+	return c.podLister.Pods(ns).List(labels.Everything())
 }
 
 func (c *ClusterCache) GetPod(ns string, name string) (*corev1.Pod, error) {
@@ -1183,37 +1227,15 @@ func (c *ClusterCache) GetPod(ns string, name string) (*corev1.Pod, error) {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	pod, ok := data.Pods[name]
-	if !ok {
-		return nil, ErrNotFoundName
-	}
-
-	return pod, nil
+	return c.podLister.Pods(ns).Get(name)
 }
 
-func (c *ClusterCache) GetAllServices(ns string) (map[string]*corev1.Service, error) {
+func (c *ClusterCache) GetAllServices(ns string) ([]*corev1.Service, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.Lock()
-	defer c.cacheMutex.Unlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	// copy
-	return data.CopyServices(), nil
+	return c.serviceLister.Services(ns).List(labels.Everything())
 }
 
 func (c *ClusterCache) GetService(ns string, name string) (*corev1.Service, error) {
@@ -1221,37 +1243,15 @@ func (c *ClusterCache) GetService(ns string, name string) (*corev1.Service, erro
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	service, ok := data.Services[name]
-	if !ok {
-		return nil, ErrNotFoundName
-	}
-
-	return service, nil
+	return c.serviceLister.Services(ns).Get(name)
 }
 
-func (c *ClusterCache) GetAllDeployments(ns string) (map[string]*v1.Deployment, error) {
+func (c *ClusterCache) GetAllDeployments(ns string) ([]*v1.Deployment, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	// copy
-	return data.CopyDeployments(), nil
+	return c.deploymentLister.Deployments(ns).List(labels.Everything())
 }
 
 func (c *ClusterCache) GetDeployment(ns string, name string) (*v1.Deployment, error) {
@@ -1259,37 +1259,15 @@ func (c *ClusterCache) GetDeployment(ns string, name string) (*v1.Deployment, er
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	dm, ok := data.Deployments[name]
-	if !ok {
-		return nil, ErrNotFoundName
-	}
-
-	return dm, nil
+	return c.deploymentLister.Deployments(ns).Get(name)
 }
 
-func (c *ClusterCache) GetAllReplicas(ns string) (map[string]*v1.ReplicaSet, error) {
+func (c *ClusterCache) GetAllReplicas(ns string) ([]*v1.ReplicaSet, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	// copy
-	return data.CopyReplicas(), nil
+	return c.replicaLister.ReplicaSets(ns).List(labels.Everything())
 }
 
 func (c *ClusterCache) GetReplica(ns string, name string) (*v1.ReplicaSet, error) {
@@ -1297,37 +1275,23 @@ func (c *ClusterCache) GetReplica(ns string, name string) (*v1.ReplicaSet, error
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	rep, ok := data.Replicas[name]
-	if !ok {
-		return nil, ErrNotFoundName
-	}
-
-	return rep, nil
+	return c.replicaLister.ReplicaSets(ns).Get(name)
 }
 
-func (c *ClusterCache) GetAllDaemons(ns string) (map[string]*v1.DaemonSet, error) {
+func (c *ClusterCache) GetAllDaemons(ns string) ([]*v1.DaemonSet, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
+	return c.daemonLister.DaemonSets(ns).List(labels.Everything())
+}
 
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
+func (c *ClusterCache) GetAllDaemonsWithLabels(ns string, filter labels.Selector) ([]*v1.DaemonSet, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
 	}
 
-	// copy
-	return data.CopyDaemons(), nil
+	return c.daemonLister.DaemonSets(ns).List(filter)
 }
 
 func (c *ClusterCache) GetDaemon(ns string, name string) (*v1.DaemonSet, error) {
@@ -1335,37 +1299,23 @@ func (c *ClusterCache) GetDaemon(ns string, name string) (*v1.DaemonSet, error) 
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	rep, ok := data.Daemons[name]
-	if !ok {
-		return nil, ErrNotFoundName
-	}
-
-	return rep, nil
+	return c.daemonLister.DaemonSets(ns).Get(name)
 }
 
-func (c *ClusterCache) GetAllStatefuls(ns string) (map[string]*v1.StatefulSet, error) {
+func (c *ClusterCache) GetAllStatefuls(ns string) ([]*v1.StatefulSet, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
+	return c.statefulLister.StatefulSets(ns).List(labels.Everything())
+}
 
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
+func (c *ClusterCache) GetAllStatefulsWithLabels(ns string, filter labels.Selector) ([]*v1.StatefulSet, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
 	}
 
-	// copy
-	return data.CopyStatefuls(), nil
+	return c.statefulLister.StatefulSets(ns).List(nil)
 }
 
 func (c *ClusterCache) GetStateful(ns string, name string) (*v1.StatefulSet, error) {
@@ -1373,82 +1323,47 @@ func (c *ClusterCache) GetStateful(ns string, name string) (*v1.StatefulSet, err
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	rep, ok := data.StatefulSets[name]
-	if !ok {
-		return nil, ErrNotFoundName
-	}
-
-	return rep, nil
+	return c.statefulLister.StatefulSets(ns).Get(name)
 }
 
-func (c *ClusterCache) GetAllEvents(ns string) (map[string]map[string][]*corev1.Event, error) {
+func (c *ClusterCache) GetAllEvents(ns string) ([]*corev1.Event, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	// copy
-	return data.CopyEvents(), nil
+	return c.eventLister.Events(ns).List(labels.Everything())
 }
 
-func (c *ClusterCache) GetEvents(ns, kind, name string) ([]*corev1.Event, error) {
+func (c *ClusterCache) GetAllEventsWithLabels(ns string, filter labels.Selector) ([]*corev1.Event, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	kinds, ok := data.Events[name]
-	if !ok {
-		return nil, ErrNotFoundName
-	}
-
-	evs, ok := kinds[kind]
-	if !ok {
-		return nil, errors.New("not found the kind")
-	}
-
-	ret := make([]*corev1.Event, len(evs))
-	copy(ret, evs)
-	return evs, nil
+	return c.eventLister.Events(ns).List(filter)
 }
 
-func (c *ClusterCache) GetAllEndpoints(ns string) (map[string]*corev1.Endpoints, error) {
+func (c *ClusterCache) GetEvents(ns, name string) (*corev1.Event, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
+	return c.eventLister.Events(ns).Get(name)
+}
 
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
+func (c *ClusterCache) GetAllEndpoints(ns string) ([]*corev1.Endpoints, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
 	}
 
-	// copy
-	return data.CopyEndpoints(), nil
+	return c.endpointLister.Endpoints(ns).List(labels.Everything())
+}
+
+func (c *ClusterCache) GetAllEndpointsWithLabels(ns string, filter labels.Selector) ([]*corev1.Endpoints, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	return c.endpointLister.Endpoints(ns).List(filter)
 }
 
 func (c *ClusterCache) GetEndpoints(ns string, name string) (*corev1.Endpoints, error) {
@@ -1456,20 +1371,7 @@ func (c *ClusterCache) GetEndpoints(ns string, name string) (*corev1.Endpoints, 
 		return nil, err
 	}
 
-	c.cacheMutex.RLock()
-	defer c.cacheMutex.RUnlock()
-
-	data, ok := c.cache[ns]
-	if !ok {
-		return nil, ErrNotFoundNamespace
-	}
-
-	rep, ok := data.Endpoints[name]
-	if !ok {
-		return nil, ErrNotFoundName
-	}
-
-	return rep, nil
+	return c.endpointLister.Endpoints(ns).Get(name)
 }
 
 func int32Ptr2(i int32) *int32 {
