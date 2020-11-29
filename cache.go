@@ -43,6 +43,7 @@ var (
 	ErrSyncResourceTimeout  = errors.New("sync resource timeout")
 	ErrCacheNotReady        = errors.New("cache not ready, wait to sync full cache in the beginning")
 	ErrBeyondExpireInterval = errors.New("beyond expire interval")
+	ErrNotSupportResource   = errors.New("not support resource")
 
 	allResources = []string{
 		TypeNamespace,
@@ -203,6 +204,7 @@ func NewClusterCache(client *Client, opts ...OptionFunc) (*ClusterCache, error) 
 		namespaces:       make(map[string]*corev1.Namespace, 5),
 		followResource:   getAllResources(),
 		followNamespaces: make(map[string]bool, 0),
+		listeners:        newListenerPool(),
 	}
 	for _, opt := range opts {
 		err := opt(cc)
@@ -222,7 +224,7 @@ type ClusterCache struct {
 	followNamespaces map[string]bool
 	isReady          bool // todo: all resource -> map[resource]bool
 	isExpired        bool
-	listeners        ListenerPool
+	listeners        *ListenerPool
 
 	stopper  chan struct{}
 	stopOnce sync.Once
@@ -285,12 +287,12 @@ func (c *ClusterCache) Reset() {
 	c.stopOnce = sync.Once{}
 }
 
-func (c *ClusterCache) RegisterListener(lis Listener) {
-	c.listeners.add(lis)
+func (c *ClusterCache) RegisterListener(genre string, lis Listener) {
+	c.listeners.add(genre, lis)
 }
 
-func (c *ClusterCache) UnRegisterListener(lis Listener) {
-	c.listeners.del(lis)
+func (c *ClusterCache) UnRegisterListener(genre string, lis Listener) {
+	c.listeners.del(genre, lis)
 }
 
 func (c *ClusterCache) healthScaner() {
@@ -471,54 +473,13 @@ func (c *ClusterCache) bindPodInformer() {
 	c.podLister = c.factory.Core().V1().Pods().Lister()
 
 	add := func(obj interface{}) {
-		pod, ok := obj.(*corev1.Pod)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(pod.Namespace) {
-			return
-		}
-
-		for lis, _ := range c.listeners.copy() {
-			if lis.IsDone() {
-				c.listeners.del(lis)
-				continue
-			}
-
-			lis.Notify(obj)
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[pod.Namespace]
-		if !ok {
-			data = newDataSet(pod.Namespace)
-			c.cache[pod.Namespace] = data
-		}
-
-		data.upsertPod(pod)
+		c.listeners.xrange(TypePod, obj)
 	}
 	update := func(oldObj, newObj interface{}) {
 		add(newObj)
 	}
 	del := func(obj interface{}) {
-		pod, ok := obj.(*corev1.Pod)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(pod.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[pod.Namespace]
-		if !ok {
-			return
-		}
-		data.deletePod(pod)
+		c.listeners.xrange(TypePod, obj)
 	}
 
 	c.podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -549,33 +510,11 @@ func (c *ClusterCache) bindNodesInformer() {
 
 	c.nodeInformer = c.factory.Core().V1().Nodes().Informer()
 	c.nodeLister = c.factory.Core().V1().Nodes().Lister()
-	add := func(obj interface{}) {
-		node, ok := obj.(*corev1.Node)
-		if !ok {
-			return
-		}
 
-		c.cacheMutex.Lock()
-		c.nodes[node.Name] = node
-		c.cacheMutex.Unlock()
-	}
-	update := func(oldObj, newObj interface{}) {
-		add(newObj)
-	}
-	del := func(obj interface{}) {
-		node, ok := obj.(*corev1.Node)
-		if !ok {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		delete(c.nodes, node.Name)
-		c.cacheMutex.Unlock()
-	}
 	c.nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    add,
-		UpdateFunc: update,
-		DeleteFunc: del,
+		AddFunc:    nil,
+		UpdateFunc: nil,
+		DeleteFunc: nil,
 	})
 }
 
@@ -596,48 +535,15 @@ func (c *ClusterCache) bindServiceInformer() {
 
 	c.serviceInformer = c.factory.Core().V1().Services().Informer()
 	c.serviceLister = c.factory.Core().V1().Services().Lister()
+
 	add := func(obj interface{}) {
-		value, ok := obj.(*corev1.Service)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			data = newDataSet(value.Namespace)
-			c.cache[value.Namespace] = data
-		}
-
-		data.upsertService(value)
+		c.listeners.xrange(TypeService, obj)
 	}
-
 	update := func(oldObj, newObj interface{}) {
 		add(newObj)
 	}
 	del := func(obj interface{}) {
-		value, ok := obj.(*corev1.Service)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			return
-		}
-
-		data.deleteService(value)
+		c.listeners.xrange(TypeService, obj)
 	}
 
 	c.serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -668,47 +574,15 @@ func (c *ClusterCache) bindDeploymentInformer() {
 
 	c.deploymentInformer = c.factory.Apps().V1().Deployments().Informer()
 	c.deploymentLister = c.factory.Apps().V1().Deployments().Lister()
+
 	add := func(obj interface{}) {
-		value, ok := obj.(*v1.Deployment)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			data = newDataSet(value.Namespace)
-			c.cache[value.Namespace] = data
-		}
-
-		data.upsertDeployment(value)
+		c.listeners.xrange(TypeDeployment, obj)
 	}
-
 	update := func(oldObj, newObj interface{}) {
 		add(newObj)
 	}
 	del := func(obj interface{}) {
-		value, ok := obj.(*corev1.Service)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			return
-		}
-		data.deleteService(value)
+		c.listeners.xrange(TypeDeployment, obj)
 	}
 
 	c.deploymentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -739,46 +613,15 @@ func (c *ClusterCache) bindReplicaInformer() {
 
 	c.replicaInformer = c.factory.Apps().V1().ReplicaSets().Informer()
 	c.replicaLister = c.factory.Apps().V1().ReplicaSets().Lister()
+
 	add := func(obj interface{}) {
-		value, ok := obj.(*v1.ReplicaSet)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			data = newDataSet(value.Namespace)
-			c.cache[value.Namespace] = data
-		}
-
-		data.upsertReplica(value)
+		c.listeners.xrange(TypeReplicaSet, obj)
 	}
 	update := func(oldObj, newObj interface{}) {
 		add(newObj)
 	}
 	del := func(obj interface{}) {
-		value, ok := obj.(*v1.ReplicaSet)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			return
-		}
-		data.deleteReplica(value)
+		c.listeners.xrange(TypeReplicaSet, obj)
 	}
 
 	c.replicaInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -809,43 +652,15 @@ func (c *ClusterCache) bindStatefulInformer() {
 
 	c.statefulInformer = c.factory.Apps().V1().StatefulSets().Informer()
 	c.statefulLister = c.factory.Apps().V1().StatefulSets().Lister()
+
 	add := func(obj interface{}) {
-		value, ok := obj.(*v1.StatefulSet)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			data = newDataSet(value.Namespace)
-			c.cache[value.Namespace] = data
-		}
-
-		data.upsertStateful(value)
+		c.listeners.xrange(TypeStatefulSet, obj)
 	}
 	update := func(oldObj, newObj interface{}) {
 		add(newObj)
 	}
 	del := func(obj interface{}) {
-		value, ok := obj.(*v1.StatefulSet)
-		if !ok {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			return
-		}
-		data.deleteStateful(value)
+		c.listeners.xrange(TypeStatefulSet, obj)
 	}
 
 	c.statefulInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -876,46 +691,15 @@ func (c *ClusterCache) bindDaemonInformer() {
 
 	c.daemonInformer = c.factory.Apps().V1().DaemonSets().Informer()
 	c.daemonLister = c.factory.Apps().V1().DaemonSets().Lister()
+
 	add := func(obj interface{}) {
-		value, ok := obj.(*v1.DaemonSet)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			data = newDataSet(value.Namespace)
-			c.cache[value.Namespace] = data
-		}
-
-		data.upsertDaemon(value)
+		c.listeners.xrange(TypeDaemonSet, obj)
 	}
 	update := func(oldObj, newObj interface{}) {
 		add(newObj)
 	}
 	del := func(obj interface{}) {
-		value, ok := obj.(*v1.DaemonSet)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			return
-		}
-		data.deleteDaemon(value)
+		c.listeners.xrange(TypeDaemonSet, obj)
 	}
 
 	c.daemonInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -946,47 +730,15 @@ func (c *ClusterCache) bindEventInformer() {
 
 	c.eventInformer = c.factory.Core().V1().Events().Informer()
 	c.eventLister = c.factory.Core().V1().Events().Lister()
+
 	add := func(obj interface{}) {
-		value, ok := obj.(*corev1.Event)
-		if !ok {
-			return
-		}
-
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			data = newDataSet(value.Namespace)
-			c.cache[value.Namespace] = data
-		}
-
-		data.upsertEvent(value)
+		c.listeners.xrange(TypeEvent, obj)
 	}
 	update := func(oldObj, newObj interface{}) {
 		add(newObj)
 	}
 	del := func(obj interface{}) {
-		value, ok := obj.(*corev1.Event)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			return
-		}
-		data.deleteEvent(value)
+		c.listeners.xrange(TypeEvent, obj)
 	}
 
 	c.eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -1017,46 +769,15 @@ func (c *ClusterCache) bindEndpointsInformer() {
 
 	c.endpointInformer = c.factory.Core().V1().Endpoints().Informer()
 	c.endpointLister = c.factory.Core().V1().Endpoints().Lister()
+
 	add := func(obj interface{}) {
-		value, ok := obj.(*corev1.Endpoints)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			data = newDataSet(value.Namespace)
-			c.cache[value.Namespace] = data
-		}
-
-		data.upsertEndpoint(value)
+		c.listeners.xrange(TypeEndpoint, obj)
 	}
 	update := func(oldObj, newObj interface{}) {
 		add(newObj)
 	}
 	del := func(obj interface{}) {
-		value, ok := obj.(*corev1.Endpoints)
-		if !ok {
-			return
-		}
-		if !c.isFollowNamespace(value.Namespace) {
-			return
-		}
-
-		c.cacheMutex.Lock()
-		defer c.cacheMutex.Unlock()
-
-		data, ok := c.cache[value.Namespace]
-		if !ok {
-			return
-		}
-		data.deleteEndpoint(value)
+		c.listeners.xrange(TypeEndpoint, obj)
 	}
 
 	c.endpointInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -1384,4 +1105,13 @@ func getAllResources() map[string]bool {
 		ret[res] = true
 	}
 	return ret
+}
+
+func isSupportedResource(genre string) bool {
+	for _, res := range allResources {
+		if res == genre {
+			return true
+		}
+	}
+	return false
 }
