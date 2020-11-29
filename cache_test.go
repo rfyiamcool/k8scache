@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
 )
 
 func TestTimout(t *testing.T) {
@@ -55,8 +56,32 @@ func TestList(t *testing.T) {
 	assert.Equal(t, err, nil)
 	assert.Greater(t, len(pods.Items), 0)
 
+	lis := NewAnyListener("default", "nginx-deployment-77c8657d4f-5qzxw", nil)
+	cc.RegisterListener(TypePod, lis)
+
+	go func() {
+		for {
+			select {
+			case ev, ok := <-lis.Receive():
+				if !ok {
+					assert.Equal(t, lis.err, nil)
+					return
+				}
+
+				obj := ev.(*v1.Pod)
+				fmt.Printf("ns: %s, podname: %s \n", obj.Namespace, obj.Name)
+			}
+		}
+	}()
+
+	time.AfterFunc(3*time.Second, func() {
+		lis.Stop()
+	})
+
 	cc.Start()
 	cc.SyncCache()
+
+	<-lis.Receive()
 }
 
 func TestSimple(t *testing.T) {
