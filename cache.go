@@ -11,14 +11,13 @@ import (
 
 	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	listappv1 "k8s.io/client-go/listers/apps/v1"
-	listcorev1 "k8s.io/client-go/listers/core/v1"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	listappv1 "k8s.io/client-go/listers/apps/v1"
+	listcorev1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -391,7 +390,10 @@ func (c *ClusterCache) SyncCacheWithTimeout(timeout time.Duration) error {
 		go func() {
 			defer wg.Done()
 			cerr := fn(timeout)
-			if err != nil {
+
+			c.cacheMutex.Lock()
+			defer c.cacheMutex.Unlock()
+			if cerr != nil {
 				err = cerr
 			}
 		}()
@@ -404,7 +406,7 @@ func (c *ClusterCache) SyncCacheWithTimeout(timeout time.Duration) error {
 	return err
 }
 
-func (c *ClusterCache) Labels(mm map[string]string) labels.Selector {
+func (c *ClusterCache) ToLabels(mm map[string]string) labels.Selector {
 	return labels.Set(mm).AsSelector()
 }
 
@@ -907,6 +909,22 @@ func (c *ClusterCache) beforeValidate() error {
 	return nil
 }
 
+func (c *ClusterCache) GetNode(name string) (*corev1.Node, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	return c.nodeLister.Get(name)
+}
+
+func (c *ClusterCache) GetNodesWithLabels(filter labels.Selector) ([]*corev1.Node, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	return c.nodeLister.List(filter)
+}
+
 func (c *ClusterCache) GetNodes() ([]*corev1.Node, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
@@ -927,6 +945,22 @@ func (c *ClusterCache) GetUpdateTime(ns string) (time.Time, error) {
 	return data.UpdateAT, nil
 }
 
+func (c *ClusterCache) GetNamespace(ns string) (*corev1.Namespace, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	return c.namespaceLister.Get(ns)
+}
+
+func (c *ClusterCache) GetNamespacesWithLabels(filter labels.Selector) ([]*corev1.Namespace, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	return c.namespaceLister.List(filter)
+}
+
 func (c *ClusterCache) GetNamespaces() ([]*corev1.Namespace, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
@@ -943,12 +977,28 @@ func (c *ClusterCache) GetAllPods(ns string) ([]*corev1.Pod, error) {
 	return c.podLister.Pods(ns).List(labels.Everything())
 }
 
+func (c *ClusterCache) GetPodsWithLabels(ns string, filter labels.Selector) ([]*corev1.Pod, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	return c.podLister.Pods(ns).List(filter)
+}
+
 func (c *ClusterCache) GetPod(ns string, name string) (*corev1.Pod, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
 	return c.podLister.Pods(ns).Get(name)
+}
+
+func (c *ClusterCache) GetServicesWithLabels(ns string, filter labels.Selector) ([]*corev1.Service, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	return c.serviceLister.Services(ns).List(filter)
 }
 
 func (c *ClusterCache) GetAllServices(ns string) ([]*corev1.Service, error) {
@@ -975,12 +1025,28 @@ func (c *ClusterCache) GetAllDeployments(ns string) ([]*v1.Deployment, error) {
 	return c.deploymentLister.Deployments(ns).List(labels.Everything())
 }
 
+func (c *ClusterCache) GetDeploymentsWithLabels(ns string, filter labels.Selector) ([]*v1.Deployment, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	return c.deploymentLister.Deployments(ns).List(filter)
+}
+
 func (c *ClusterCache) GetDeployment(ns string, name string) (*v1.Deployment, error) {
 	if err := c.beforeValidate(); err != nil {
 		return nil, err
 	}
 
 	return c.deploymentLister.Deployments(ns).Get(name)
+}
+
+func (c *ClusterCache) GetReplicasWithLabels(ns string, filter labels.Selector) ([]*v1.ReplicaSet, error) {
+	if err := c.beforeValidate(); err != nil {
+		return nil, err
+	}
+
+	return c.replicaLister.ReplicaSets(ns).List(filter)
 }
 
 func (c *ClusterCache) GetAllReplicas(ns string) ([]*v1.ReplicaSet, error) {
